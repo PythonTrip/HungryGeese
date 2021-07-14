@@ -25,44 +25,86 @@ optim = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 loss = torch.nn.MSELoss()
 
 
-def calc_td_loss(states, actions, rewards, next_states, is_done, gamma=0.99, check_shapes=False):
+def calc_td_loss(states, actions, rewards, next_states, gamma=0.99, check_shapes=False):
     states = torch.tensor(states, dtype=torch.float32)  # shape: [batch_size, state_size]
     actions = torch.tensor(actions, dtype=torch.long)  # shape: [batch_size]
     rewards = torch.tensor(rewards, dtype=torch.float32)  # shape: [batch_size]
     next_states = torch.tensor(next_states, dtype=torch.float32)  # shape: [batch_size, state_size]
 
+    predicted_qvalues = classifier(states)
+    predicted_qvalues_for_actions = predicted_qvalues[range(states.shape[0]), actions]
 
-def select_elites(states_batch, actions_batch, rewards_batch):
-    max_rew = np.argmax(rewards_batch, 1)
+    with torch.no_grad():
+        predicted_next_qvalues = classifier(next_states)
+
+    next_state_values = torch.max(predicted_next_qvalues, 1).values
+
+    target_qvalues_for_actions = rewards + next_state_values * gamma
+
+    loss = torch.mean((predicted_qvalues_for_actions - target_qvalues_for_actions.detach()) ** 2)
+    # добавляем регуляризацию на значения Q
+    loss += 0.1 * predicted_qvalues_for_actions.mean()
+
+    return loss
+
+
+def select_elites(states_batch, actions_batch, rewards_batch, total_rewards):
+    states_batch = list(states_batch)
+    actions_batch = list(actions_batch)
+    rewards_batch = list(rewards_batch)
+    total_rewards = list(total_rewards)
+
+    max_rew = np.argmax(total_rewards, 1)
 
     elite_state = []
     elite_actions = []
+    elite_rewards = []
+
     for i, mr in enumerate(max_rew):
         elite_state.append(states_batch[i][mr])
         elite_actions.append(actions_batch[i][mr])
-    return elite_state, elite_actions
+        elite_rewards.append(rewards_batch[i][mr])
+
+    return elite_state, elite_actions, elite_rewards
 
 
 def calc_reward(session, count_geese):
-    rewards = [0] * count_geese
+    total_rewards = [0] * count_geese
+    rewards_batch = []
     len_geese = [1] * count_geese
+    start_dist = [-1] * count_geese
 
+    reward_buffer = []
     for k in range(count_geese):
         for j in range(len(session)):
             current_length = len(session[j][0].observation.geese[k])
 
             if current_length == 0:
-                rewards[k] -= 100
+                total_rewards[k] -= 1.
+                reward_buffer.append(total_rewards[k])
+                break
 
-            rewards[k] -= 10
+            if start_dist[k] == -1:
+                start_dist[k] = food_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food)
+            else:
+                new_dist = food_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food)
+                total_rewards[k] += (start_dist[k] - new_dist) / 10.
+                start_dist[k] = new_dist
+
+            total_rewards[k] -= 0.05
+
             if current_length > len_geese[k]:
-                rewards[k] += 100
+                total_rewards[k] += 1
                 len_geese[k] = current_length
 
             elif current_length < len_geese[k]:
-                rewards[k] -= 50
+                total_rewards[k] -= 0.5
                 len_geese[k] = current_length
-    return rewards
+
+            reward_buffer.append(total_rewards[k])
+        rewards_batch.append(reward_buffer)
+        reward_buffer = []
+    return rewards_batch, total_rewards
 
 
 def base_point(rc):
@@ -92,9 +134,9 @@ class Actions:
             "SOUTH"
         ]
         self.actions_ = {
-            0: None,  # F
-            1: None,  # L
-            2: None  # R
+            0: "EAST",  # F
+            1: "SOUTH",  # L
+            2: "WEST"  # R
         }
 
     @staticmethod
@@ -127,22 +169,11 @@ class Actions:
                 self.actions_[i] = choice(self.base_actions)
                 return
 
-                # possible = self.base_actions.copy()
-        # possible.remove(last_action)
-
         self.actions_[0] = self.tuple2act(tuple(map((-1).__mul__, self.act2tuple(last_action))))
 
         forward_ind = self.base_actions.index(self.actions_[0])
         self.actions_[1] = self.base_actions[forward_ind - 1]
         self.actions_[2] = self.base_actions[(forward_ind + 1) if forward_ind < n_dirs else 0]
-
-    # def actions_by_board(self, all_geese, head, last_action):
-    #     self.possible_actions(last_action)
-    #     all_obstacles = list(itertools.chain(*all_geese))
-    #     for act in actions:
-    #         if row_col(head, 11) + self.act2tuple(act) in all_obstacles:
-    #             actions.remove(act)
-    #     return actions
 
 
 class AAgent(ABC):
@@ -162,7 +193,7 @@ class AAgent(ABC):
 
         self.states_batch = []
         self.actions_batch = []
-        self.epsilon = 0.1
+        self.epsilon = 0.5
 
     def get_base(self, obs_dict, config_dict):
         self.observation = Observation(obs_dict)
@@ -200,6 +231,8 @@ class MLPAgent(AAgent):
         state = np.array([self.player_head, *self.food]) / 77
         self.states_batch.append(state)
 
+        self.actions.possible_actions(self.last_act)
+
         q_value = classifier(torch.tensor([self.player_head, *self.food]) / 77).detach().numpy().tolist()
 
         act = self.actions.actions_[np.argmax(q_value)] if random() > self.epsilon else choice(self.actions.actions_)
@@ -215,7 +248,8 @@ def generate_session(env, agents: AAgent):
     states = [x.states_batch for x in agents]
     actions = [x.actions_batch for x in agents]
 
-    return states, actions, calc_reward(state, len(agents))
+    rewards, total_rewards = calc_reward(state, len(agents))
+    return states, actions, rewards, total_rewards
 
 
 base_agent = BaseAgent()
@@ -224,15 +258,30 @@ n_sessions = 2
 
 log = []
 
-for i in range(2):
+for i in range(1):
     sessions = [generate_session(env, [base_agent, MLPAgent(), MLPAgent()]) for _ in
                 range(n_sessions)]
 
-    states_batch, actions_batch, rewards_batch = map(np.array, zip(*sessions))
+    states_batch, actions_batch, rewards_batch, total_rewards = zip(*sessions)
 
-    elite_states, elite_actions = select_elites(states_batch, actions_batch, rewards_batch)
+    print(states_batch)
+    elite_states, elite_actions, elite_reward = select_elites(states_batch, actions_batch, rewards_batch,
+                                                              total_rewards)
 
-    optim.zero_grad()
+    s = []
+    next_s = []
+    a = []
+    r = []
+
+    for _ in range(len(elite_states)):
+        s.append([x for x in elite_states[:len(elite_states)]])
+        a.append([x for x in elite_actions[:len(elite_actions)]])
+        next_s.append([x for x in elite_states[1:]])
+        r.append([x for x in elite_reward[1:]])
+
+    # optim.zero_grad()
+    # calc_td_loss(s[0], [a], [r], [next_s]).backward()
+    # optim.step()
 
     # show_progress(rewards_batch, log, percentile, reward_range=[0, np.max(rewards_batch)])
 
