@@ -1,5 +1,5 @@
 from kaggle_environments import make
-from kaggle_environments.envs.hungry_geese.hungry_geese import Observation, Configuration, Action, row_col
+from kaggle_environments.envs.hungry_geese.hungry_geese import *
 import itertools
 from functools import lru_cache
 from typing import Tuple
@@ -25,13 +25,22 @@ optim = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 loss = torch.nn.MSELoss()
 
 
-def calc_td_loss(states, actions, rewards, next_states, gamma=0.99, check_shapes=False):
+def calc_td_loss(states, actions, rewards, gamma=0.99, check_shapes=False):
+    next_states = states[1:]
+    states = states[:-1]
+    actions = actions[:-1]
+    rewards = rewards[1:-1]
+    if len(states) == 0:
+        return
+
     states = torch.tensor(states, dtype=torch.float32)  # shape: [batch_size, state_size]
     actions = torch.tensor(actions, dtype=torch.long)  # shape: [batch_size]
     rewards = torch.tensor(rewards, dtype=torch.float32)  # shape: [batch_size]
     next_states = torch.tensor(next_states, dtype=torch.float32)  # shape: [batch_size, state_size]
 
+
     predicted_qvalues = classifier(states)
+    # print(states.shape, actions.shape, rewards.shape)
     predicted_qvalues_for_actions = predicted_qvalues[range(states.shape[0]), actions]
 
     with torch.no_grad():
@@ -39,12 +48,14 @@ def calc_td_loss(states, actions, rewards, next_states, gamma=0.99, check_shapes
 
     next_state_values = torch.max(predicted_next_qvalues, 1).values
 
+    # print(next_state_values, rewards)
+
     target_qvalues_for_actions = rewards + next_state_values * gamma
 
     loss = torch.mean((predicted_qvalues_for_actions - target_qvalues_for_actions.detach()) ** 2)
     # добавляем регуляризацию на значения Q
     loss += 0.1 * predicted_qvalues_for_actions.mean()
-
+    print(loss)
     return loss
 
 
@@ -64,6 +75,10 @@ def select_elites(states_batch, actions_batch, rewards_batch, total_rewards):
         elite_state.append(states_batch[i][mr])
         elite_actions.append(actions_batch[i][mr])
         elite_rewards.append(rewards_batch[i][mr])
+
+    # print("Elite")
+    # print(elite_rewards)
+    # print(elite_actions)
 
     return elite_state, elite_actions, elite_rewards
 
@@ -85,9 +100,9 @@ def calc_reward(session, count_geese):
                 break
 
             if start_dist[k] == -1:
-                start_dist[k] = food_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food)
+                start_dist[k] = min_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food, 11)
             else:
-                new_dist = food_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food)
+                new_dist = min_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food, 11)
                 total_rewards[k] += (start_dist[k] - new_dist) / 10.
                 start_dist[k] = new_dist
 
@@ -107,69 +122,28 @@ def calc_reward(session, count_geese):
     return rewards_batch, total_rewards
 
 
-def base_point(rc):
-    return rc[0] * config["columns"] + rc[1]
+class PossibleAction:
+    NORTH = "NORTH"
+    EAST = "EAST"
+    SOUTH = "SOUTH"
+    WEST = "WEST"
 
-
-def sum_by_elements(a, b):
-    return tuple([a[i] + b[i] for i in range(2)])
-
-
-def food_distance(position: int, food: [int]):
-    columns = config["columns"]
-    row, column = row_col(position, columns)
-    return min(
-        abs(row - food_row) + abs(column - food_column)
-        for food_position in food
-        for food_row, food_column in [row_col(food_position, columns)]
-    )
-
-
-class Actions:
     def __init__(self):
         self.base_actions = [
-            "WEST",
-            "NORTH",
-            "EAST",
-            "SOUTH"
+            self.WEST,
+            self.SOUTH,
+            self.EAST,
+            self.NORTH
         ]
-        self.actions_ = {
-            0: "EAST",  # F
-            1: "SOUTH",  # L
-            2: "WEST"  # R
-        }
+        self.actions_ = [self.NORTH, self.EAST, self.WEST]  # F L R
 
-    @staticmethod
-    def act2tuple(act: str):
-        return {
-            "EAST": (1, 0),
-            "WEST": (-1, 0),
-            "NORTH": (0, -1),
-            "SOUTH": (0, 1)
-        }[act]
-
-    @staticmethod
-    def tuple2act(t: Tuple[int, int]):
-        if t[0] == 0:
-            if t[1] == 1:
-                return "NORTH"
-            if t[1] == -1:
-                return "SOUTH"
-        if t[1] == 0:
-            if t[0] == 1:
-                return "EAST"
-            if t[0] == -1:
-                return "WEST"
-        raise ValueError(f"Can't convert tuple {t}")
-
-    @lru_cache(5)
     def possible_actions(self, last_action=None):
         if last_action is None:
             for i in range(n_dirs):
                 self.actions_[i] = choice(self.base_actions)
                 return
 
-        self.actions_[0] = self.tuple2act(tuple(map((-1).__mul__, self.act2tuple(last_action))))
+        self.actions_[0] = last_action
 
         forward_ind = self.base_actions.index(self.actions_[0])
         self.actions_[1] = self.base_actions[forward_ind - 1]
@@ -178,7 +152,7 @@ class Actions:
 
 class AAgent(ABC):
     def __init__(self):
-        self.actions = Actions()
+        self.actions = PossibleAction()
         self.last_act = None
 
         self.observation = None
@@ -206,8 +180,34 @@ class AAgent(ABC):
         self.all_geese = self.observation.geese
         self.food = self.observation.food
 
+    def create_map(self):
+        player_map = np.zeros((self.configuration.rows, self.configuration.columns))
+
+        player_index = self.observation.index
+        player_goose = self.observation.geese[player_index]
+        player_row, player_column = row_col(player_goose[0], self.configuration.columns)
+        player_map[player_row, player_column] = -1
+
+        for pos in player_goose[1:]:
+            r, c = row_col(pos, self.configuration.columns)
+            player_map[r, c] = 1
+
+        other_map = np.zeros((self.configuration.rows, self.configuration.columns))
+        for i, goose_points in enumerate(self.observation.geese):
+            if player_index == i:
+                continue
+            for pos in goose_points:
+                r, c = row_col(pos, self.configuration.columns)
+                other_map[r, c] = 1
+
+        food_map = np.zeros((self.configuration.rows, self.configuration.columns))
+        for pos in self.observation.food:
+            r, c = row_col(pos, self.configuration.columns)
+            food_map[r, c] = 1
+
     @abstractmethod
-    def agent(self, obs_dict, config_dict): pass
+    def agent(self, obs_dict, config_dict):
+        pass
 
 
 class BaseAgent(AAgent):
@@ -216,17 +216,18 @@ class BaseAgent(AAgent):
 
         self.actions.possible_actions(last_action=self.last_act)
 
-        act = choice([x for x in self.actions.actions_.values()])
+        act = choice([x for x in self.actions.actions_])
         self.last_act = act
 
         self.states_batch.append(np.array([self.player_head, *self.food]) / 77)
-        self.actions_batch.append(act)
+        self.actions_batch.append(self.actions.actions_.index(act))
         return act
 
 
 class MLPAgent(AAgent):
     def agent(self, obs_dict, config_dict):
         self.get_base(obs_dict, config_dict)
+        self.create_map()
 
         state = np.array([self.player_head, *self.food]) / 77
         self.states_batch.append(state)
@@ -236,6 +237,7 @@ class MLPAgent(AAgent):
         q_value = classifier(torch.tensor([self.player_head, *self.food]) / 77).detach().numpy().tolist()
 
         act = self.actions.actions_[np.argmax(q_value)] if random() > self.epsilon else choice(self.actions.actions_)
+        self.actions_batch.append(self.actions.actions_.index(act))
         self.last_act = act
 
         return act
@@ -254,34 +256,26 @@ def generate_session(env, agents: AAgent):
 
 base_agent = BaseAgent()
 
-n_sessions = 2
+n_sessions = 5
 
 log = []
 
-for i in range(1):
-    sessions = [generate_session(env, [base_agent, MLPAgent(), MLPAgent()]) for _ in
+for i in range(5):
+    sessions = [generate_session(env, [MLPAgent(), MLPAgent(), MLPAgent()]) for _ in
                 range(n_sessions)]
 
     states_batch, actions_batch, rewards_batch, total_rewards = zip(*sessions)
 
-    print(states_batch)
-    elite_states, elite_actions, elite_reward = select_elites(states_batch, actions_batch, rewards_batch,
-                                                              total_rewards)
+    elite_states, elite_actions, elite_rewards = select_elites(states_batch, actions_batch, rewards_batch,
+                                                               total_rewards)
 
-    s = []
-    next_s = []
-    a = []
-    r = []
-
-    for _ in range(len(elite_states)):
-        s.append([x for x in elite_states[:len(elite_states)]])
-        a.append([x for x in elite_actions[:len(elite_actions)]])
-        next_s.append([x for x in elite_states[1:]])
-        r.append([x for x in elite_reward[1:]])
-
-    # optim.zero_grad()
-    # calc_td_loss(s[0], [a], [r], [next_s]).backward()
-    # optim.step()
+    for n in range(len(elite_states)):
+        optim.zero_grad()
+        loss = calc_td_loss(elite_states[n], elite_actions[n], elite_rewards[n])
+        if loss is None:
+            continue
+        loss.backward()
+        optim.step()
 
     # show_progress(rewards_batch, log, percentile, reward_range=[0, np.max(rewards_batch)])
 
