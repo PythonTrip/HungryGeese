@@ -1,9 +1,6 @@
 from kaggle_environments import make
 from kaggle_environments.envs.hungry_geese.hungry_geese import *
-import itertools
-from functools import lru_cache
-from typing import Tuple
-from time import time
+from matplotlib import pyplot as plt
 from abc import abstractmethod, ABC
 from random import choice, random
 import torch
@@ -14,30 +11,45 @@ config = {"columns": 11, "rows": 7, "hunger_rate": 40, "min_food": 2}
 n_actions = 4
 n_dirs = 3
 
-classifier = torch.nn.Sequential(
-    torch.nn.Linear(3, 32),
-    torch.nn.ReLU(),
-    torch.nn.Linear(32, 32),
-    torch.nn.ReLU(),
-    torch.nn.Linear(32, 3)
-)
+
+class Net(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 8, 3, bias=True)
+
+        self.linear1 = torch.nn.Linear(360, 64)
+        self.linear2 = torch.nn.Linear(64, 32)
+        self.Q = torch.nn.Linear(32, 3)
+
+        self.relu = torch.nn.ReLU()
+        self.flatten = torch.nn.Flatten()
+
+    def forward(self, x):
+        x = self.relu(self.conv(x))
+        x = self.flatten(x)
+        x = self.relu(self.linear1(x))
+        x = self.relu(self.linear2(x))
+        x = self.Q(x)
+
+        return x
+
+
+classifier = Net()
 optim = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 loss = torch.nn.MSELoss()
 
 
-def calc_td_loss(states, actions, rewards, gamma=0.99, check_shapes=False):
-    next_states = states[1:]
-    states = states[:-1]
+def calc_td_loss(states, actions, rewards, gamma=0.85, check_shapes=False):
     actions = actions[:-1]
     rewards = rewards[1:-1]
     if len(states) == 0:
         return
 
-    states = torch.tensor(states, dtype=torch.float32)  # shape: [batch_size, state_size]
+    states = torch.cat([x.unsqueeze_(0).float() for x in states], dim=0)
+    next_states = states[1:]
+    states = states[:-1]
     actions = torch.tensor(actions, dtype=torch.long)  # shape: [batch_size]
     rewards = torch.tensor(rewards, dtype=torch.float32)  # shape: [batch_size]
-    next_states = torch.tensor(next_states, dtype=torch.float32)  # shape: [batch_size, state_size]
-
 
     predicted_qvalues = classifier(states)
     # print(states.shape, actions.shape, rewards.shape)
@@ -46,6 +58,8 @@ def calc_td_loss(states, actions, rewards, gamma=0.99, check_shapes=False):
     with torch.no_grad():
         predicted_next_qvalues = classifier(next_states)
 
+    if len(predicted_next_qvalues) == 0:
+        return
     next_state_values = torch.max(predicted_next_qvalues, 1).values
 
     # print(next_state_values, rewards)
@@ -54,8 +68,7 @@ def calc_td_loss(states, actions, rewards, gamma=0.99, check_shapes=False):
 
     loss = torch.mean((predicted_qvalues_for_actions - target_qvalues_for_actions.detach()) ** 2)
     # добавляем регуляризацию на значения Q
-    loss += 0.1 * predicted_qvalues_for_actions.mean()
-    print(loss)
+    # loss += 0.1 * predicted_qvalues_for_actions.mean()
     return loss
 
 
@@ -95,21 +108,22 @@ def calc_reward(session, count_geese):
             current_length = len(session[j][0].observation.geese[k])
 
             if current_length == 0:
-                total_rewards[k] -= 1.
+                total_rewards[k] -= 2.  # if j > 15 else 5
                 reward_buffer.append(total_rewards[k])
-                break
+                continue
 
             if start_dist[k] == -1:
                 start_dist[k] = min_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food, 11)
             else:
                 new_dist = min_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food, 11)
-                total_rewards[k] += (start_dist[k] - new_dist) / 10.
+                total_rewards[k] += (start_dist[k] - new_dist) / start_dist[k]
                 start_dist[k] = new_dist
 
             total_rewards[k] -= 0.05
 
             if current_length > len_geese[k]:
-                total_rewards[k] += 1
+                total_rewards[k] += 5
+                start_dist[k] = min_distance(session[j][0].observation.geese[k][0], session[j][0].observation.food, 11)
                 len_geese[k] = current_length
 
             elif current_length < len_geese[k]:
@@ -167,7 +181,7 @@ class AAgent(ABC):
 
         self.states_batch = []
         self.actions_batch = []
-        self.epsilon = 0.5
+        self.epsilon = 0.15
 
     def get_base(self, obs_dict, config_dict):
         self.observation = Observation(obs_dict)
@@ -186,11 +200,11 @@ class AAgent(ABC):
         player_index = self.observation.index
         player_goose = self.observation.geese[player_index]
         player_row, player_column = row_col(player_goose[0], self.configuration.columns)
-        player_map[player_row, player_column] = -1
+        player_map[player_row, player_column] = 1
 
         for pos in player_goose[1:]:
             r, c = row_col(pos, self.configuration.columns)
-            player_map[r, c] = 1
+            player_map[r, c] = -1
 
         other_map = np.zeros((self.configuration.rows, self.configuration.columns))
         for i, goose_points in enumerate(self.observation.geese):
@@ -198,12 +212,13 @@ class AAgent(ABC):
                 continue
             for pos in goose_points:
                 r, c = row_col(pos, self.configuration.columns)
-                other_map[r, c] = 1
+                other_map[r, c] = -1
 
         food_map = np.zeros((self.configuration.rows, self.configuration.columns))
         for pos in self.observation.food:
             r, c = row_col(pos, self.configuration.columns)
             food_map[r, c] = 1
+        return player_map, other_map, food_map
 
     @abstractmethod
     def agent(self, obs_dict, config_dict):
@@ -227,14 +242,16 @@ class BaseAgent(AAgent):
 class MLPAgent(AAgent):
     def agent(self, obs_dict, config_dict):
         self.get_base(obs_dict, config_dict)
-        self.create_map()
+        player_map, other_map, food_map = self.create_map()
+        state = torch.tensor([player_map, other_map, food_map])
+        self.epsilon *= 0.9
 
-        state = np.array([self.player_head, *self.food]) / 77
+        # state = np.array([self.player_head, *self.food]) / 77
         self.states_batch.append(state)
 
         self.actions.possible_actions(self.last_act)
 
-        q_value = classifier(torch.tensor([self.player_head, *self.food]) / 77).detach().numpy().tolist()
+        q_value = classifier(state[None, ...].float()).detach().numpy().tolist()
 
         act = self.actions.actions_[np.argmax(q_value)] if random() > self.epsilon else choice(self.actions.actions_)
         self.actions_batch.append(self.actions.actions_.index(act))
@@ -256,11 +273,12 @@ def generate_session(env, agents: AAgent):
 
 base_agent = BaseAgent()
 
-n_sessions = 5
+n_epochs = 20
+n_sessions = 50
 
-log = []
+history = {"loss": [], "reward": []}
 
-for i in range(5):
+for i in range(n_epochs):
     sessions = [generate_session(env, [MLPAgent(), MLPAgent(), MLPAgent()]) for _ in
                 range(n_sessions)]
 
@@ -268,14 +286,21 @@ for i in range(5):
 
     elite_states, elite_actions, elite_rewards = select_elites(states_batch, actions_batch, rewards_batch,
                                                                total_rewards)
-
+    optim.zero_grad()
+    loss = 0
     for n in range(len(elite_states)):
-        optim.zero_grad()
-        loss = calc_td_loss(elite_states[n], elite_actions[n], elite_rewards[n])
-        if loss is None:
+        batch_loss = calc_td_loss(elite_states[n], elite_actions[n], elite_rewards[n])
+        if batch_loss is None:
             continue
-        loss.backward()
-        optim.step()
+
+        loss += batch_loss
+    loss.backward()
+    optim.step()
+
+    history["loss"].append(loss)
+    history["reward"].append(np.mean([x[-1] for x in elite_rewards]))
+    print(
+        f"Epoch: {i} \t Mean loss: {loss / n_sessions} \t Mean elite rewards: {np.mean([x[-1] for x in elite_rewards])}")
 
     # show_progress(rewards_batch, log, percentile, reward_range=[0, np.max(rewards_batch)])
 
@@ -283,4 +308,9 @@ for i in range(5):
     #     print("Принято!")
     #     break
 
+# plt.plot(range(n_epochs), history["loss"])
+# plt.show()
+#
+# plt.plot(range(n_epochs), history["reward"])
+# plt.show()
 env.render(mode="ipython", width=800, height=600)
