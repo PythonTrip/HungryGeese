@@ -18,13 +18,15 @@ total_rewards = 0
 len_geese = 1
 start_dist = -1
 
+epoch = 0
 
-def calc_reward(goose, food):
+
+def calc_reward(goose, food, step):
     global total_rewards, len_geese, start_dist
     goose_len = len(goose)
 
     if goose_len == 0:
-        total_rewards -= 2.  # if j > 15 else 5
+        total_rewards -= 2. if step > 15 else 15
         return total_rewards
 
     goose_head = goose[0]
@@ -33,13 +35,13 @@ def calc_reward(goose, food):
         start_dist = min_distance(goose_head, food, 11)
     else:
         new_dist = min_distance(goose_head, food, 11)
-        total_rewards += (start_dist - new_dist) / start_dist
-        start_dist = new_dist
+        total_rewards += (start_dist - new_dist) / start_dist * 2
+        # start_dist = new_dist
 
-    total_rewards -= 0.05
+    total_rewards -= 0.5
 
     if goose_len > len_geese:
-        total_rewards += 5
+        total_rewards += 15
         start_dist = min_distance(goose_head, food, 11)
         len_geese = goose_len
 
@@ -128,17 +130,24 @@ class CustomEnv(gym.Env):
     def step(self, action):
         self.act.possible_actions(self.last_act)
         actions = [self.act.actions_[action] for _ in range(len(self.agents))]
-        observation = kaggle_env.step(actions)
+        observation = kaggle_env.step(actions)[0]
 
-        state = np.array(create_map(observation[0]["observation"], 0))
-        # print(observation)
-        reward = calc_reward(observation[0]["observation"].geese[0], observation[0]["observation"].food)
-        done = observation[0]["status"]
+        obs = observation["observation"]
+
+        state = np.array(create_map(obs, 0))
+
+        reward = calc_reward(obs.geese[0], obs.food, obs.step)
+        done = observation["status"]
         info = {}
         return state, reward, done, info
 
     def reset(self):
-        global total_rewards
+        global total_rewards, epoch
+
+        if epoch % 100 == 0:
+            print(f"Epoch: {epoch}, reward: {total_rewards}")
+
+        epoch += 1
         total_rewards = 0
         observation: Observation = kaggle_env.reset(len(self.agents))[0].observation
 
@@ -175,22 +184,8 @@ env = CustomEnv([1] * 3)
 state = env.reset()
 
 agent = PPO("MlpPolicy", env)
-agent.learn(1)
+agent.learn(25000)
 
-kaggle_env = make("hungry_geese", configuration=CONFIG, debug=True)
-kaggle_env.run([Agent(agent).agent, Agent(agent).agent, 'greedy'])
-kaggle_env.render(mode="ipython", width=800, height=600)
-# obs = env.reset()
-# n_steps = 100
-# for step in range(n_steps):
-#     action, _ = agent.predict(obs, deterministic=True)
-#     print("Step {}".format(step + 1))
-#     print("Action: ", action)
-#     obs, reward, done, info = env.step(action)
-#     print('obs=', obs, 'reward=', reward, 'done=', done)
-#     env.render(mode='console')
-#     if done:
-#         # Note that the VecEnv resets automatically
-#         # when a done signal is encountered
-#         print("Goal reached!", "reward=", reward)
-#         break
+kaggle_demo = make("hungry_geese", configuration=CONFIG, debug=True)
+kaggle_demo.run([Agent(agent).agent, Agent(agent).agent])
+kaggle_demo.render(mode="ipython", width=800, height=600)
